@@ -1,0 +1,54 @@
+{
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "cmake",
+            "command": "cmake",
+            "args": [
+                "-GNinja",
+                "-DCMAKE_BUILD_TYPE=Debug",
+                "-DLLVM_DIR=../llvm-12/lib/cmake/llvm",
+                "-DCMAKE_INSTALL_PREFIX=../tinylang",
+                "../tinylang/"
+            ],
+            "options": {
+                "cwd": "/home/llvm/build-tinylang"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "调试器生成的任务。"
+        },
+        {
+            "type": "shell",
+            "label": "ninja",
+            "command": "ninja",
+            "options": {
+                "cwd": "/home/llvm/build-tinylang"
+            },
+        },
+        {
+            "type": "shell",
+            "label": "ninja install",
+            "command": "ninja",
+            "args": [
+                "install"
+            ],
+            "options": {
+                "cwd": "/home/llvm/build-tinylang"
+            },
+        },
+        {
+            "type": "shell",
+            "label": "mybuild",
+            "dependsOn": [
+                "cmake",
+                "ninja",
+                "ninja install"
+            ],
+            "dependsOrder": "sequence"
+        }
+    ],
+    "version": "2.0.0"
+}

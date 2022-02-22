@@ -1,0 +1,5 @@
+{
+    "cmake.configureArgs": [
+        "-DLLVM_DIR=/home/llvm/llvm-12/lib/cmake/llvm"
+    ]
+}
