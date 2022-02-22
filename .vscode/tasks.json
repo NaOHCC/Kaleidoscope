@@ -8,11 +8,11 @@
                 "-GNinja",
                 "-DCMAKE_BUILD_TYPE=Debug",
                 "-DLLVM_DIR=../llvm-12/lib/cmake/llvm",
-                "-DCMAKE_INSTALL_PREFIX=../tinylang",
-                "../tinylang/"
+                "-DCMAKE_INSTALL_PREFIX=../Kaleidoscope",
+                "${workspaceFolderBasename}"
             ],
             "options": {
-                "cwd": "/home/llvm/build-tinylang"
+                "cwd": "/home/llvm/build-Kaleidoscope"
             },
             "group": {
                 "kind": "build",
@@ -25,7 +25,7 @@
             "label": "ninja",
             "command": "ninja",
             "options": {
-                "cwd": "/home/llvm/build-tinylang"
+                "cwd": "/home/llvm/build-Kaleidoscope"
             },
         },
         {
@@ -36,7 +36,7 @@
                 "install"
             ],
             "options": {
-                "cwd": "/home/llvm/build-tinylang"
+                "cwd": "/home/llvm/build-Kaleidoscope"
             },
         },
         {
