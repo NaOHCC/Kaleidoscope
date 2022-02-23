@@ -97,6 +97,7 @@ class ExprAST
 {
 public:
     virtual ~ExprAST() {}
+    virtual Value *codegen() = 0;
 };
 
 // 数字表达式的AST类, 形如 "1.0"
@@ -106,6 +107,7 @@ class NumberExprAST : public ExprAST
 
 public:
     NumberExprAST(double Val) : Val(Val) {}
+    virtual Value *codegen() override;
 };
 
 // 变量引用的表达式AST类, 形如 "a"
@@ -115,6 +117,7 @@ class VariableExprAST : public ExprAST
 
 public:
     VariableExprAST(const string &Name) : Name(Name) {}
+    virtual Value *codegen() override;
 };
 
 // 二元运算符的AST类
@@ -126,6 +129,7 @@ class BinaryExprAST : public ExprAST
 public:
     BinaryExprAST(char op, unique_ptr<ExprAST> LHS, unique_ptr<ExprAST> RHS)
         : Op(op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+    virtual Value *codegen() override;
 };
 
 // 函数调用表达式的AST类
@@ -137,6 +141,7 @@ class CallExprAST : public ExprAST
 public:
     CallExprAST(const string &Callee, vector<unique_ptr<ExprAST>> Args)
         : Callee(Callee), Args(std::move(Args)) {}
+    virtual Value *codegen() override;
 };
 
 // 函数原型的AST类
@@ -149,6 +154,7 @@ public:
     PrototypeAST(const string Name, vector<string> Args)
         : Name(Name), Args(std::move(Args)) {}
     const string getName() const { return Name; }
+    Function *codegen();
 };
 
 // 函数的AST类, 表示定义本身
@@ -160,6 +166,7 @@ class FunctionAST
 public:
     FunctionAST(unique_ptr<PrototypeAST> Proto, unique_ptr<ExprAST> Body)
         : Proto(std::move(Proto)), Body(std::move(Body)) {}
+    Function *codegen();
 };
 
 static int CurTok; //缓冲
@@ -173,6 +180,8 @@ unique_ptr<ExprAST> LogError(const char *Str)
     fprintf(stderr, "LogError: %s\n", Str);
     return nullptr;
 }
+
+// 原型错误
 unique_ptr<PrototypeAST> LogErrorP(const char *Str)
 {
     LogError(Str);
@@ -374,14 +383,185 @@ static unique_ptr<FunctionAST> ParseTopLevelExpr()
 }
 
 //===----------------------------------------------------------------------===//
-// Top-Level parsing
+// Code Generation
 //===----------------------------------------------------------------------===//
+static LLVMContext TheContext;
+static IRBuilder<> Builder(TheContext);
+static unique_ptr<Module> TheModule;
+static map<string, Value *> NamedValues; // 当前作用域的符号表
+
+// 代码生成时错误
+Value *LogErrorV(const char *Str)
+{
+    LogError(Str);
+    return nullptr;
+}
+/**
+ * @brief 创建并返回一个ConstantFP.
+ * 数值常量由ConstantFP类表示，该类在内部保存APFloat中的数值
+ * (APFloat可以保存任意精度的浮点常量
+ *
+ * @return Value* ConstantFP数值常量
+ */
+Value *NumberExprAST::codegen()
+{
+    return ConstantFP::get(TheContext, APFloat(Val));
+}
+
+/**
+ * @brief 检查map中是否有指定的名称(如果没有，则表示引用了一个未知变量)并返回该变量的值
+ *
+ * @return Value* 变量的值
+ */
+Value *VariableExprAST::codegen()
+{
+    // 在函数中查找变量
+    Value *V = NamedValues[Name];
+    if (!V)
+        LogErrorV("Unknown variable name");
+    return V;
+}
+
+/**
+ * @brief 递归生成运算符左侧的代码, 接着是右侧的, 最后计算二元表达式结果
+ *
+ * @return Value*
+ */
+Value *BinaryExprAST::codegen()
+{
+    Value *L = LHS->codegen();
+    Value *R = RHS->codegen();
+    if (!L || !R)
+        return nullptr;
+
+    switch (Op)
+    {
+    case '+':
+        return Builder.CreateFAdd(L, R, "addtmp");
+    case '-':
+        return Builder.CreateFSub(L, R, "subtmp");
+    case '*':
+        return Builder.CreateFMul(L, R, "multmp");
+    case '<':
+        L = Builder.CreateFCmpULT(L, R, "cmptmp");
+        // 将布尔值 0/1 转换为 0.0 或 1.0
+        return Builder.CreateUIToFP(L, Type::getDoubleTy(TheContext), "booltmp");
+    default:
+        return LogErrorV("invalid binary operator");
+    }
+}
+
+/**
+ * @brief 函数调用代码生成
+ *
+ * @return Value*
+ */
+Value *CallExprAST::codegen()
+{
+    // 在全局模块表中查找名称
+    Function *CalleeF = TheModule->getFunction(Callee);
+    if (!CalleeF)
+        return LogErrorV("Unknown function referenced");
+
+    // 检查参数数量
+    if (CalleeF->arg_size() != Args.size())
+        return LogErrorV("Incorrect # arguments passed");
+
+    vector<Value *> ArgsV;
+    for (unsigned i = 0, e = Args.size(); i != e; ++i)
+    {
+        ArgsV.push_back(Args[i]->codegen());
+        if (!ArgsV.back())
+            return nullptr;
+    }
+
+    return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+/**
+ * @brief 生成函数声明的IR
+ *
+ * @return Function*
+ */
+Function *PrototypeAST::codegen()
+{
+    // 创建函数类型: double(double,double) etc.
+    vector<Type *> Doubles(Args.size(), Type::getDoubleTy(TheContext));
+
+    FunctionType *FT = FunctionType::get(Type::getDoubleTy(TheContext), Doubles, false);
+    // 创建函数原型的IR
+    Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+    // 为所有参数设置名称
+    unsigned Idx = 0;
+    for (auto &Arg : F->args())
+        Arg.setName(Args[Idx++]);
+    return F;
+}
+
+Function *FunctionAST::codegen()
+{
+    // 从之前 extern 声明中检查现有函数
+    Function *TheFunction = TheModule->getFunction(Proto->getName());
+
+    // 如果没有, 则生成一个函数原型
+    if (!TheFunction)
+        TheFunction = Proto->codegen();
+
+    if (!TheFunction)
+        return nullptr;
+
+    if (!TheFunction->empty())
+        return (Function *)LogErrorV("Function cannot be redefined.");
+
+    // 创建一个基本块以开始插入IR
+    BasicBlock *BB = BasicBlock::Create(TheContext, "entry", TheFunction);
+    Builder.SetInsertPoint(BB);
+
+    // 在 NamedValues 中记录函数参数
+    NamedValues.clear();
+    for (auto &Arg : TheFunction->args())
+        NamedValues[string(Arg.getName())] = &Arg;
+
+    if (Value *RetVal = Body->codegen())
+    {
+        // 结束函数
+        Builder.CreateRet(RetVal);
+        // 验证生成的代码
+        verifyFunction(*TheFunction);
+
+        return TheFunction;
+    }
+
+    // 错误处理, 删除生成的函数
+    TheFunction->eraseFromParent();
+    return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+// static void InitializeModule()
+// {
+//     // Open a new context and module.
+//     TheContext = make_unique<LLVMContext>();
+//     TheModule = make_unique<Module>("my cool jit", *TheContext);
+
+//     // Create a new builder for the module.
+//     Builder = make_unique<IRBuilder<>>(*TheContext);
+// }
 
 static void HandleDefinition()
 {
-    if (ParseDefinition())
+    if (auto FnAST = ParseDefinition())
     {
-        fprintf(stderr, "Parsed a function definition.\n");
+        if (auto *FnIR = FnAST->codegen())
+        {
+            fprintf(stderr, "Read function definition:");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     }
     else
     {
@@ -392,9 +572,14 @@ static void HandleDefinition()
 
 static void HandleExtern()
 {
-    if (ParseExtern())
+    if (auto ProtoAST = ParseExtern())
     {
-        fprintf(stderr, "Parsed an extern\n");
+        if (auto *FnIR = ProtoAST->codegen())
+        {
+            fprintf(stderr, "Read extern: ");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     }
     else
     {
@@ -406,9 +591,17 @@ static void HandleExtern()
 static void HandleTopLevelExpression()
 {
     // Evaluate a top-level expression into an anonymous function.
-    if (ParseTopLevelExpr())
+    if (auto FnAST = ParseTopLevelExpr())
     {
-        fprintf(stderr, "Parsed a top-level expr\n");
+        if (auto *FnIR = FnAST->codegen())
+        {
+            fprintf(stderr, "Read top-level expression:");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+
+            // Remove the anonymous expression.
+            FnIR->eraseFromParent();
+        }
     }
     else
     {
@@ -460,8 +653,112 @@ int main()
     fprintf(stderr, "ready> ");
     getNextToken();
 
+    // Make the module, which holds all the code.
+
     // Run the main "interpreter loop" now.
     MainLoop();
 
+    // Print out all of the generated code.
+    TheModule->print(errs(), nullptr);
+
     return 0;
 }
+
+//===============================================================================
+//===============================================================================
+//===============================================================================
+//===============================================================================
+
+// //===----------------------------------------------------------------------===//
+// // Top-Level parsing
+// //===----------------------------------------------------------------------===//
+
+// static void HandleDefinition()
+// {
+//     if (ParseDefinition())
+//     {
+//         fprintf(stderr, "Parsed a function definition.\n");
+//     }
+//     else
+//     {
+//         // Skip token for error recovery.
+//         getNextToken();
+//     }
+// }
+
+// static void HandleExtern()
+// {
+//     if (ParseExtern())
+//     {
+//         fprintf(stderr, "Parsed an extern\n");
+//     }
+//     else
+//     {
+//         // Skip token for error recovery.
+//         getNextToken();
+//     }
+// }
+
+// // 将顶层表达式计算为匿名函数
+// static void HandleTopLevelExpression()
+// {
+//     // Evaluate a top-level expression into an anonymous function.
+//     if (ParseTopLevelExpr())
+//     {
+//         fprintf(stderr, "Parsed a top-level expr\n");
+//     }
+//     else
+//     {
+//         // Skip token for error recovery.
+//         getNextToken();
+//     }
+// }
+
+// // top ::= definition | external | expression | ';'
+// static void MainLoop()
+// {
+//     while (true)
+//     {
+//         fprintf(stderr, "ready> ");
+//         switch (CurTok)
+//         {
+//         case tok_eof:
+//             return;
+//         case ';': // ignore top-level semicolons.
+//             getNextToken();
+//             break;
+//         case tok_def:
+//             HandleDefinition();
+//             break;
+//         case tok_extern:
+//             HandleExtern();
+//             break;
+//         default:
+//             HandleTopLevelExpression();
+//             break;
+//         }
+//     }
+// }
+
+// //===----------------------------------------------------------------------===//
+// // Main driver code.
+// //===----------------------------------------------------------------------===//
+
+// int main()
+// {
+//     // Install standard binary operators.
+//     // 1 is lowest precedence.
+//     BinopPrecedence['<'] = 10;
+//     BinopPrecedence['+'] = 20;
+//     BinopPrecedence['-'] = 20;
+//     BinopPrecedence['*'] = 40; // highest.
+
+//     // Prime the first token.
+//     fprintf(stderr, "ready> ");
+//     getNextToken();
+
+//     // Run the main "interpreter loop" now.
+//     MainLoop();
+
+//     return 0;
+// }
