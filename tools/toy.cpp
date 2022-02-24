@@ -1,3 +1,4 @@
+#include "KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -27,6 +28,7 @@
 #include <vector>
 
 using namespace llvm;
+using namespace llvm::orc;
 using namespace std;
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -393,11 +395,13 @@ static unique_ptr<FunctionAST> ParseTopLevelExpr()
 //===----------------------------------------------------------------------===//
 // Code Generation
 //===----------------------------------------------------------------------===//
-static LLVMContext TheContext;
-static IRBuilder<> Builder(TheContext);
+static unique_ptr<LLVMContext> TheContext;
 static unique_ptr<Module> TheModule;
+static unique_ptr<IRBuilder<>> Builder;
 static map<string, Value *> NamedValues; // 当前作用域的符号表
 static unique_ptr<legacy::FunctionPassManager> TheFPM;
+static unique_ptr<KaleidoscopeJIT> TheJIT;
+static ExitOnError ExitOnErr;
 
 // 代码生成时错误
 Value *LogErrorV(const char *Str)
@@ -414,7 +418,7 @@ Value *LogErrorV(const char *Str)
  */
 Value *NumberExprAST::codegen()
 {
-    return ConstantFP::get(TheContext, APFloat(Val));
+    return ConstantFP::get(*TheContext, APFloat(Val));
 }
 
 /**
@@ -446,15 +450,15 @@ Value *BinaryExprAST::codegen()
     switch (Op)
     {
     case '+':
-        return Builder.CreateFAdd(L, R, "addtmp");
+        return Builder->CreateFAdd(L, R, "addtmp");
     case '-':
-        return Builder.CreateFSub(L, R, "subtmp");
+        return Builder->CreateFSub(L, R, "subtmp");
     case '*':
-        return Builder.CreateFMul(L, R, "multmp");
+        return Builder->CreateFMul(L, R, "multmp");
     case '<':
-        L = Builder.CreateFCmpULT(L, R, "cmptmp");
+        L = Builder->CreateFCmpULT(L, R, "cmptmp");
         // 将布尔值 0/1 转换为 0.0 或 1.0
-        return Builder.CreateUIToFP(L, Type::getDoubleTy(TheContext), "booltmp");
+        return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp");
     default:
         return LogErrorV("invalid binary operator");
     }
@@ -484,7 +488,7 @@ Value *CallExprAST::codegen()
             return nullptr;
     }
 
-    return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+    return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
 }
 
 /**
@@ -495,9 +499,9 @@ Value *CallExprAST::codegen()
 Function *PrototypeAST::codegen()
 {
     // 创建函数类型: double(double,double) etc.
-    vector<Type *> Doubles(Args.size(), Type::getDoubleTy(TheContext));
+    vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
 
-    FunctionType *FT = FunctionType::get(Type::getDoubleTy(TheContext), Doubles, false);
+    FunctionType *FT = FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
     // 创建函数原型的IR
     Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
 
@@ -524,8 +528,8 @@ Function *FunctionAST::codegen()
         return (Function *)LogErrorV("Function cannot be redefined.");
 
     // 创建一个基本块以开始插入IR
-    BasicBlock *BB = BasicBlock::Create(TheContext, "entry", TheFunction);
-    Builder.SetInsertPoint(BB);
+    BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
+    Builder->SetInsertPoint(BB);
 
     // 在 NamedValues 中记录函数参数
     NamedValues.clear();
@@ -536,7 +540,7 @@ Function *FunctionAST::codegen()
     if (Value *RetVal = Body->codegen())
     {
         // 结束函数
-        Builder.CreateRet(RetVal);
+        Builder->CreateRet(RetVal);
         // 验证生成的代码
         verifyFunction(*TheFunction);
 
@@ -558,7 +562,11 @@ Function *FunctionAST::codegen()
 static void InitializeModuleAndPassManager()
 {
     // Open a new context and module.
-    TheModule = std::make_unique<Module>("my cool jit", TheContext);
+    TheContext = make_unique<LLVMContext>();
+    TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+    // TheModule->setDataLayout(TheJIT->getDataLayout());
+
+    Builder = make_unique<IRBuilder<>>(*TheContext);
 
     // 创建pass管理器
     TheFPM = make_unique<legacy::FunctionPassManager>(TheModule.get());
@@ -614,6 +622,7 @@ static void HandleExtern()
 static void HandleTopLevelExpression()
 {
     // Evaluate a top-level expression into an anonymous function.
+    // 两次遍历, 先生成AST, 再遍历生成IR
     if (auto FnAST = ParseTopLevelExpr())
     {
         // 两次遍历, 先生成AST, 再遍历生成IR
@@ -625,6 +634,22 @@ static void HandleTopLevelExpression()
 
             // Remove the anonymous expression.
             FnIR->eraseFromParent();
+
+            // // 创建一个 ResourceTracker 来跟踪分配给匿名表达式的JIT内存
+            // // 这样我们可以在执行后释放它。
+            // auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+            // auto TSM = ThreadSafeModule(std::move(TheModule), make_unique<LLVMContext>());
+            // ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+            // InitializeModuleAndPassManager();
+
+            // // 搜索JIT中的__anon_expr符号
+            // auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+
+            // double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+            // fprintf(stderr, "Evaluated to %f\n", FP());
+
+            // ExitOnErr(RT->remove());
         }
     }
     else
@@ -666,6 +691,10 @@ static void MainLoop()
 
 int main()
 {
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
+
     // Install standard binary operators.
     // 1 is lowest precedence.
     BinopPrecedence['<'] = 10;
@@ -679,6 +708,8 @@ int main()
 
     // Make the module, which holds all the code.
     InitializeModuleAndPassManager();
+
+    // TheJIT = make_unique<KaleidoscopeJIT>();
 
     // Run the main "interpreter loop" now.
     MainLoop();
