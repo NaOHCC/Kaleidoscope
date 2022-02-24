@@ -523,6 +523,7 @@ Function *FunctionAST::codegen()
     for (auto &Arg : TheFunction->args())
         NamedValues[string(Arg.getName())] = &Arg;
 
+    // 生成函数体
     if (Value *RetVal = Body->codegen())
     {
         // 结束函数
@@ -593,6 +594,7 @@ static void HandleTopLevelExpression()
     // Evaluate a top-level expression into an anonymous function.
     if (auto FnAST = ParseTopLevelExpr())
     {
+        // 两次遍历, 先生成AST, 再遍历生成IR
         if (auto *FnIR = FnAST->codegen())
         {
             fprintf(stderr, "Read top-level expression:");
@@ -654,6 +656,7 @@ int main()
     getNextToken();
 
     // Make the module, which holds all the code.
+    TheModule = std::make_unique<Module>("my cool jit", TheContext);
 
     // Run the main "interpreter loop" now.
     MainLoop();
