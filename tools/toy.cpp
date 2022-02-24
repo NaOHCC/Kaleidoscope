@@ -6,11 +6,19 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <algorithm>
+#include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -389,6 +397,7 @@ static LLVMContext TheContext;
 static IRBuilder<> Builder(TheContext);
 static unique_ptr<Module> TheModule;
 static map<string, Value *> NamedValues; // 当前作用域的符号表
+static unique_ptr<legacy::FunctionPassManager> TheFPM;
 
 // 代码生成时错误
 Value *LogErrorV(const char *Str)
@@ -531,6 +540,9 @@ Function *FunctionAST::codegen()
         // 验证生成的代码
         verifyFunction(*TheFunction);
 
+        // 优化函数
+        TheFPM->run(*TheFunction);
+
         return TheFunction;
     }
 
@@ -543,15 +555,25 @@ Function *FunctionAST::codegen()
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
 
-// static void InitializeModule()
-// {
-//     // Open a new context and module.
-//     TheContext = make_unique<LLVMContext>();
-//     TheModule = make_unique<Module>("my cool jit", *TheContext);
+static void InitializeModuleAndPassManager()
+{
+    // Open a new context and module.
+    TheModule = std::make_unique<Module>("my cool jit", TheContext);
 
-//     // Create a new builder for the module.
-//     Builder = make_unique<IRBuilder<>>(*TheContext);
-// }
+    // 创建pass管理器
+    TheFPM = make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+    // 窥孔优化和bit-twiddling optzns
+    TheFPM->add(createInstructionCombiningPass());
+    // 重新关联表达式
+    TheFPM->add(createReassociatePass());
+    // 消除子表达式
+    TheFPM->add(createGVNPass());
+    // CFG优化
+    TheFPM->add(createCFGSimplificationPass());
+
+    TheFPM->doFinalization();
+}
 
 static void HandleDefinition()
 {
@@ -612,7 +634,7 @@ static void HandleTopLevelExpression()
     }
 }
 
-/// top ::= definition | external | expression | ';'
+// top ::= definition | external | expression | ';'
 static void MainLoop()
 {
     while (true)
@@ -656,7 +678,7 @@ int main()
     getNextToken();
 
     // Make the module, which holds all the code.
-    TheModule = std::make_unique<Module>("my cool jit", TheContext);
+    InitializeModuleAndPassManager();
 
     // Run the main "interpreter loop" now.
     MainLoop();
