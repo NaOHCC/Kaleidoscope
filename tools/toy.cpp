@@ -386,7 +386,7 @@ static unique_ptr<FunctionAST> ParseTopLevelExpr()
     if (auto E = ParseExpression())
     {
         // 创建匿名函数
-        auto Proto = make_unique<PrototypeAST>("", vector<string>());
+        auto Proto = make_unique<PrototypeAST>("__anon_expr", vector<string>());
         return make_unique<FunctionAST>(std::move(Proto), std::move(E));
     }
     return nullptr;
@@ -563,8 +563,8 @@ static void InitializeModuleAndPassManager()
 {
     // Open a new context and module.
     TheContext = make_unique<LLVMContext>();
-    TheModule = std::make_unique<Module>("my cool jit", *TheContext);
-    // TheModule->setDataLayout(TheJIT->getDataLayout());
+    TheModule = make_unique<Module>("my cool jit", *TheContext);
+    TheModule->setDataLayout(TheJIT->getDataLayout());
 
     Builder = make_unique<IRBuilder<>>(*TheContext);
 
@@ -626,30 +626,25 @@ static void HandleTopLevelExpression()
     if (auto FnAST = ParseTopLevelExpr())
     {
         // 两次遍历, 先生成AST, 再遍历生成IR
-        if (auto *FnIR = FnAST->codegen())
+        if (FnAST->codegen())
         {
-            fprintf(stderr, "Read top-level expression:");
-            FnIR->print(errs());
-            fprintf(stderr, "\n");
+            // 创建一个 ResourceTracker 来跟踪分配给匿名表达式的JIT内存
+            // 这样我们可以在执行后释放它。
+            auto RT = TheJIT->getMainJITDylib().createResourceTracker();
 
-            // Remove the anonymous expression.
-            FnIR->eraseFromParent();
+            auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+            ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+            // 开启新模块存放后续代码
+            InitializeModuleAndPassManager();
 
-            // // 创建一个 ResourceTracker 来跟踪分配给匿名表达式的JIT内存
-            // // 这样我们可以在执行后释放它。
-            // auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+            // 搜索JIT中的__anon_expr符号
+            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
 
-            // auto TSM = ThreadSafeModule(std::move(TheModule), make_unique<LLVMContext>());
-            // ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
-            // InitializeModuleAndPassManager();
+            double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+            fprintf(stderr, "Evaluated to %f\n", FP());
 
-            // // 搜索JIT中的__anon_expr符号
-            // auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
-
-            // double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
-            // fprintf(stderr, "Evaluated to %f\n", FP());
-
-            // ExitOnErr(RT->remove());
+            // 删除JIT中的匿名模块
+            ExitOnErr(RT->remove());
         }
     }
     else
@@ -706,10 +701,10 @@ int main()
     fprintf(stderr, "ready> ");
     getNextToken();
 
+    TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+
     // Make the module, which holds all the code.
     InitializeModuleAndPassManager();
-
-    // TheJIT = make_unique<KaleidoscopeJIT>();
 
     // Run the main "interpreter loop" now.
     MainLoop();
