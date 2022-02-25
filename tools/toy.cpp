@@ -401,6 +401,8 @@ static unique_ptr<IRBuilder<>> Builder;
 static map<string, Value *> NamedValues; // 当前作用域的符号表
 static unique_ptr<legacy::FunctionPassManager> TheFPM;
 static unique_ptr<KaleidoscopeJIT> TheJIT;
+static map<string, unique_ptr<PrototypeAST>> FunctionProtos; // 保存函数的最新原型
+
 static ExitOnError ExitOnErr;
 
 // 代码生成时错误
@@ -463,6 +465,27 @@ Value *BinaryExprAST::codegen()
         return LogErrorV("invalid binary operator");
     }
 }
+/**
+ * @brief Get the Function object
+ * 在TheModule中搜索现有的函数声明，如果没有找到，
+ * 则退回到从FunctionProtos生成新的声明
+ * @param Name 函数名
+ * @return Function*
+ */
+Function *getFunction(string Name)
+{
+    // 首先查找该函数是否在当前模块中
+    if (auto *F = TheModule->getFunction(Name))
+        return F;
+
+    // 如果没有, 检查是否可以从一些现有的原型代码生成声明
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end())
+        return FI->second->codegen();
+
+    // 不存在原型, 返回nullptr
+    return nullptr;
+}
 
 /**
  * @brief 函数调用代码生成
@@ -472,7 +495,7 @@ Value *BinaryExprAST::codegen()
 Value *CallExprAST::codegen()
 {
     // 在全局模块表中查找名称
-    Function *CalleeF = TheModule->getFunction(Callee);
+    Function *CalleeF = getFunction(Callee);
     if (!CalleeF)
         return LogErrorV("Unknown function referenced");
 
@@ -514,18 +537,13 @@ Function *PrototypeAST::codegen()
 
 Function *FunctionAST::codegen()
 {
-    // 从之前 extern 声明中检查现有函数
-    Function *TheFunction = TheModule->getFunction(Proto->getName());
-
-    // 如果没有, 则生成一个函数原型
-    if (!TheFunction)
-        TheFunction = Proto->codegen();
-
+    // 将原型的所有权转移到 FunctionProtos 映射
+    // 但保留对它的引用以供下面使用
+    auto &P = *Proto;
+    FunctionProtos[Proto->getName()] = std::move(Proto);
+    Function *TheFunction = getFunction(P.getName());
     if (!TheFunction)
         return nullptr;
-
-    if (!TheFunction->empty())
-        return (Function *)LogErrorV("Function cannot be redefined.");
 
     // 创建一个基本块以开始插入IR
     BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
@@ -592,6 +610,9 @@ static void HandleDefinition()
             fprintf(stderr, "Read function definition:");
             FnIR->print(errs());
             fprintf(stderr, "\n");
+            // 将新函数定义传递到JIT, 并创建一个新模块
+            ExitOnErr(TheJIT->addModule(ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+            InitializeModuleAndPassManager();
         }
     }
     else
@@ -610,6 +631,8 @@ static void HandleExtern()
             fprintf(stderr, "Read extern: ");
             FnIR->print(errs());
             fprintf(stderr, "\n");
+            // 添加新原型
+            FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
         }
     }
     else
@@ -619,6 +642,10 @@ static void HandleExtern()
     }
 }
 
+/**
+ * @brief 每个表达式都是一个Module, 即不以def, extern 开头的表达式
+ *
+ */
 static void HandleTopLevelExpression()
 {
     // Evaluate a top-level expression into an anonymous function.
@@ -632,6 +659,7 @@ static void HandleTopLevelExpression()
             // 这样我们可以在执行后释放它。
             auto RT = TheJIT->getMainJITDylib().createResourceTracker();
 
+            // 将IR添加到JIT中, 生成可执行代码
             auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
             ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
             // 开启新模块存放后续代码
@@ -678,6 +706,30 @@ static void MainLoop()
             break;
         }
     }
+}
+
+//===----------------------------------------------------------------------===//
+// "Library" functions that can be "extern'd" from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X)
+{
+    fputc((char)X, stderr);
+    return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double X)
+{
+    fprintf(stderr, "%f\n", X);
+    return 0;
 }
 
 //===----------------------------------------------------------------------===//
