@@ -40,6 +40,11 @@ enum Token
     tok_extern = -3,
     tok_identifier = -4,
     tok_number = -5,
+    tok_if = -6,
+    tok_then = -7,
+    tok_else = -8,
+    tok_for = -9,
+    tok_in = -10,
 };
 
 static string IdentifierStr; // token为tok_identifier时填充
@@ -65,6 +70,16 @@ static int gettok()
             return tok_def;
         if (IdentifierStr == "extern")
             return tok_extern;
+        if (IdentifierStr == "if")
+            return tok_if;
+        if (IdentifierStr == "then")
+            return tok_then;
+        if (IdentifierStr == "else")
+            return tok_else;
+        if (IdentifierStr == "for")
+            return tok_for;
+        if (IdentifierStr == "in")
+            return tok_in;
         return tok_identifier;
     }
     // 识别数字
@@ -179,6 +194,33 @@ public:
     Function *codegen();
 };
 
+// IfExprAST - if/then/else 的类
+class IfExprAST : public ExprAST
+{
+    unique_ptr<ExprAST> Cond, Then, Else;
+
+public:
+    IfExprAST(unique_ptr<ExprAST> Cond, unique_ptr<ExprAST> Then, unique_ptr<ExprAST> Else)
+        : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+    Value *codegen() override;
+};
+
+// ForExprAST - Expression class for for/in.
+class ForExprAST : public ExprAST
+{
+    string VarName;
+    unique_ptr<ExprAST> Start, End, Step, Body;
+
+public:
+    ForExprAST(const string &VarName, unique_ptr<ExprAST> Start,
+               unique_ptr<ExprAST> End, unique_ptr<ExprAST> Step,
+               unique_ptr<ExprAST> Body)
+        : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+          Step(std::move(Step)), Body(std::move(Body)) {}
+
+    Value *codegen() override;
+};
+
 static int CurTok; //缓冲
 static int getNextToken()
 {
@@ -259,6 +301,85 @@ static unique_ptr<ExprAST> ParseIdentifierExpr()
     return make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+// ifexpr ::= 'if' expression 'then' expression 'else' expression
+static unique_ptr<ExprAST> ParseIfExpr()
+{
+    getNextToken(); // eat the if.
+
+    // 条件部分
+    auto Cond = ParseExpression();
+    if (!Cond)
+        return nullptr;
+
+    if (CurTok != tok_then)
+        return LogError("expected then");
+    getNextToken(); // eat the then
+
+    auto Then = ParseExpression();
+    if (!Then)
+        return nullptr;
+
+    if (CurTok != tok_else)
+        return LogError("expected else");
+
+    getNextToken();
+
+    auto Else = ParseExpression();
+    if (!Else)
+        return nullptr;
+
+    return make_unique<IfExprAST>(std::move(Cond), std::move(Then),
+                                  std::move(Else));
+}
+
+// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+static unique_ptr<ExprAST> ParseForExpr()
+{
+    getNextToken(); // eat the for
+    if (CurTok != tok_identifier)
+        return LogError("expected identifier after for");
+
+    string IdName = IdentifierStr;
+    getNextToken(); // eat identifier
+
+    if (CurTok != '=')
+        return LogError("expected '=' after for");
+    getNextToken(); // eat '='
+
+    auto Start = ParseExpression();
+    if (!Start)
+        return nullptr;
+    if (CurTok != ',')
+        return LogError("expected ',' after for start value");
+    getNextToken();
+
+    auto End = ParseExpression();
+    if (!End)
+        return nullptr;
+
+    // step值可选
+    unique_ptr<ExprAST> Step;
+    if (CurTok == ',')
+    {
+        getNextToken();
+        Step = ParseExpression();
+        if (!Step)
+            return nullptr;
+    }
+
+    if (CurTok != tok_in)
+        return LogError("expected 'in' after for");
+    getNextToken(); // eat 'in'
+
+    auto Body = ParseExpression();
+    if (!Body)
+        return nullptr;
+
+    return make_unique<ForExprAST>(IdName, std::move(Start),
+                                   std::move(End), std::move(Step),
+                                   std::move(Body));
+}
+
 // primary
 //   ::= identifierexpr
 //   ::= numberexpr
@@ -275,6 +396,10 @@ static unique_ptr<ExprAST> ParsePrimary()
         return ParseNumberExpr();
     case '(':
         return ParseParenExpr();
+    case tok_if:
+        return ParseIfExpr();
+    case tok_for:
+        return ParseForExpr();
     }
 }
 
@@ -573,6 +698,143 @@ Function *FunctionAST::codegen()
     return nullptr;
 }
 
+Value *IfExprAST::codegen()
+{
+    Value *CondV = Cond->codegen();
+    if (!CondV)
+        return nullptr;
+
+    // 通过比较不等于 0.0 将条件转换为布尔值
+    CondV = Builder->CreateFCmpONE(CondV, ConstantFP::get(*TheContext, APFloat(0.0)), "ifcond");
+
+    // if语句所在的函数
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // 给then和else创建块, 在TheFunction函数末尾插入then块, 其它两个块尚未插入
+    BasicBlock *ThenBB = BasicBlock::Create(*TheContext, "then", TheFunction);
+    BasicBlock *ElseBB = BasicBlock::Create(*TheContext, "else");
+    BasicBlock *MergeBB = BasicBlock::Create(*TheContext, "ifcont"); // 汇合处
+
+    // 创建一个进行分支选择的IR
+    Builder->CreateCondBr(CondV, ThenBB, ElseBB);
+
+    // 移动插入点到then块中, 重头开始插入
+    // 发射then值
+    Builder->SetInsertPoint(ThenBB);
+
+    Value *ThenV = Then->codegen();
+    if (!ThenV)
+        return nullptr;
+
+    // then块结束, 创建无条件分支跳转, 合并块
+    Builder->CreateBr(MergeBB);
+
+    // then块中可能会更改Builder发射的块, 例如包含一个嵌套if表达式
+    // 递归调用codegen()可能会改变当前block, 需要设置Phi节点的代码为最新值
+    ThenBB = Builder->GetInsertBlock();
+
+    // 发射else块
+    TheFunction->getBasicBlockList().push_back(ElseBB); // 将else块添加到函数中
+    Builder->SetInsertPoint(ElseBB);
+
+    Value *ElseV = Else->codegen();
+    if (!ElseV)
+        return nullptr;
+
+    Builder->CreateBr(MergeBB);
+    // 递归调用codegen()可能会改变当前block, 需要设置Phi节点的代码为最新值
+    ElseBB = Builder->GetInsertBlock();
+
+    // 发射merge块
+    TheFunction->getBasicBlockList().push_back(MergeBB); // 将merge块添加到函数中
+    Builder->SetInsertPoint(MergeBB);
+    PHINode *PN = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, "iftmp");
+
+    // 给phi节点设置block/value对
+    PN->addIncoming(ThenV, ThenBB);
+    PN->addIncoming(ElseV, ElseBB);
+    return PN;
+}
+
+Value *ForExprAST::codegen()
+{
+    // 发射start部分的IR(即初始化变量的表达式), 这个范围内没有变量
+    Value *StartVal = Start->codegen();
+    if (!StartVal)
+        return nullptr;
+
+    // 为循环头的开始设置基本块, 在当前块后插入
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+    BasicBlock *PreheaderBB = Builder->GetInsertBlock(); // 循环开始部分
+    BasicBlock *LoopBB = BasicBlock::Create(*TheContext, "loop", TheFunction);
+
+    // 显式从当前块跳转到LoopBB块
+    Builder->CreateBr(LoopBB);
+
+    // 开始在LoopBB中插入
+    Builder->SetInsertPoint(LoopBB);
+
+    // 将循环开始的Start作为phi节点初始值, 现在还不能设置第二个值
+    PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName.c_str());
+    Variable->addIncoming(StartVal, PreheaderBB);
+
+    // 在循环中, 变量被定义为PHI节点, 如果隐藏了外部同名变量
+    // 出循环后要恢复它的值, 所有现在保存它
+    Value *OldVal = NamedValues[VarName];
+    NamedValues[VarName] = Variable;
+
+    // 发射循环体IR, 这与任何其他expr一样, 可以更改当前BB
+    // 请注意, 我们忽略了主体计算的值, 但不允许出现错误
+    if (!Body->codegen())
+        return nullptr;
+
+    // 发射step值
+    Value *StepVal = nullptr;
+    if (Step)
+    {
+        StepVal = Step->codegen();
+        if (!StepVal)
+            return nullptr;
+    }
+    else
+    {
+        // 使用默认步长
+        StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
+    }
+
+    Value *NextVal = Builder->CreateFAdd(Variable, StepVal, "nextvar");
+
+    // 计算end条件
+    Value *EndCond = End->codegen();
+    if (!EndCond)
+        return nullptr;
+
+    // 通过比较将不等于0.0的条件转换为布尔值
+    EndCond = Builder->CreateFCmpONE(EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
+
+    // 创建after loop块并插入
+    BasicBlock *LoopEndBB = Builder->GetInsertBlock();
+    BasicBlock *AfterBB = BasicBlock::Create(*TheContext, "afterloop", TheFunction);
+
+    // 将条件分支插入LoopEndBB末尾
+    Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
+
+    // 循环体结束, 以后其它代码都插入到AfterBB
+    Builder->SetInsertPoint(AfterBB);
+
+    // 给PHI节点一个新入口
+    Variable->addIncoming(NextVal, LoopEndBB);
+
+    // 恢复隐藏的变量
+    if (OldVal)
+        NamedValues[VarName] = OldVal;
+    else
+        NamedValues.erase(VarName);
+
+    // for循环的代码生成总是返回0.0
+    return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
+
 //===----------------------------------------------------------------------===//
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
@@ -667,9 +929,9 @@ static void HandleTopLevelExpression()
 
             // 搜索JIT中的__anon_expr符号
             auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
-
+            fprintf(stderr, "\n");
             double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
-            fprintf(stderr, "Evaluated to %f\n", FP());
+            fprintf(stderr, "\nEvaluated to %f\n", FP());
 
             // 删除JIT中的匿名模块
             ExitOnErr(RT->remove());

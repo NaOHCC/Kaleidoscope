@@ -13,7 +13,9 @@
 // identifierexpr ::= identifier | ( identifier '(' expression* ')' )
 // parenexpr ::= '(' expression ')'
 // numberexpr ::= number
+// ifexpr ::= 'if' expression 'then' expression 'else' expression
 
+// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
 ```
 
 ## JIT
