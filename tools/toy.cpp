@@ -929,9 +929,9 @@ static void HandleTopLevelExpression()
 
             // 搜索JIT中的__anon_expr符号
             auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
-
+            fprintf(stderr, "\n");
             double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
-            fprintf(stderr, "Evaluated to %f\n", FP());
+            fprintf(stderr, "\nEvaluated to %f\n", FP());
 
             // 删除JIT中的匿名模块
             ExitOnErr(RT->remove());
