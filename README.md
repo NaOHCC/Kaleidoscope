@@ -5,7 +5,7 @@
 // toplevelexpr ::= expression # toplevelexpr = expression
 // definition ::= 'def' prototype expression
 // external ::= 'extern' prototype
-// prototype ::= id '(' id* ')' | (binary LETTER number? (id, id))
+// prototype ::= id '(' id* ')' | binary LETTER number? (id, id) | unary LETTER (id)
 
 // expression ::= primary binoprhs
 // binoprhs ::= ('+' primary)*
@@ -16,6 +16,8 @@
 // ifexpr ::= 'if' expression 'then' expression 'else' expression
 
 // forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+// unary ::= primary | ('!' unary)
+
 ```
 
 ## JIT
