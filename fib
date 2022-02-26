@@ -1,0 +1,37 @@
+# Define ':' for sequencing: as a low-precedence operator that ignores operands
+    # and just returns the RHS.
+    def binary: 1 (x y) y;
+
+    # Recursive fib, we could do this before.
+    def fib(x)
+      if (x < 3) then
+        1
+      else
+        fib(x-1)+fib(x-2);
+
+Read function definition:define double @fib(double %x) {
+entry:
+  %cmptmp = fcmp ult double %x, 3.000000e+00
+  br i1 %cmptmp, label %ifcont, label %else
+
+else:                                             ; preds = %entry
+  %subtmp = fadd double %x, -1.000000e+00
+  %calltmp = call double @fib(double %subtmp)
+  %subtmp5 = fadd double %x, -2.000000e+00
+  %calltmp6 = call double @fib(double %subtmp5)
+  %addtmp = fadd double %calltmp, %calltmp6
+  br label %ifcont
+
+ifcont:                                           ; preds = %entry, %else
+  %iftmp = phi double [ %addtmp, %else ], [ 1.000000e+00, %entry ]
+  ret double %iftmp
+}
+
+    # Iterative fib.
+    def fibi(x)
+      var a = 1, b = 1, c in
+      (for i = 3, i < x in
+         c = a + b : a = b : b = c) :b;
+
+    # Call it.
+    fibi(10);

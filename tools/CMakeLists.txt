@@ -1,4 +1,4 @@
-set(LLVM_LINK_COMPONENTS 
+set(LLVM_LINK_COMPONENTS
   Analysis
   Core
   ExecutionEngine
@@ -8,7 +8,9 @@ set(LLVM_LINK_COMPONENTS
   RuntimeDyld
   ScalarOpts
   Support
+  TransformUtils
   native
-)
+  )
+add_compile_options(-frtti)
 set(CMAKE_EXE_LINKER_FLAGS "-Xlinker -export-dynamic")
 add_kaleidoscope_tool(kaleidoscope toy.cpp)

@@ -6,6 +6,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -16,6 +17,7 @@
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Utils.h"
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -25,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace llvm;
@@ -149,6 +152,7 @@ class VariableExprAST : public ExprAST
 public:
     VariableExprAST(const string &Name) : Name(Name) {}
     virtual Value *codegen() override;
+    const string getName() const { return Name; }
 };
 
 // 二元运算符的AST类
@@ -620,7 +624,7 @@ static unique_ptr<FunctionAST> ParseTopLevelExpr()
 static unique_ptr<LLVMContext> TheContext;
 static unique_ptr<Module> TheModule;
 static unique_ptr<IRBuilder<>> Builder;
-static map<string, Value *> NamedValues; // 当前作用域的符号表
+static map<string, AllocaInst *> NamedValues; // 当前作用域的符号表, 现在它保存变量的内存地址而不是值
 static unique_ptr<legacy::FunctionPassManager> TheFPM;
 static unique_ptr<KaleidoscopeJIT> TheJIT;
 static map<string, unique_ptr<PrototypeAST>> FunctionProtos; // 保存函数的最新原型
@@ -657,6 +661,19 @@ Function *getFunction(string Name)
 }
 
 /**
+ * @brief 在函数入口块中创建一条alloca指令, 这用于可变变量
+ *
+ * @param TheFunction
+ * @param VarName
+ * @return AllocaInst*
+ */
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction, StringRef VarName)
+{
+    IRBuilder<> TmpB(&TheFunction->getEntryBlock(), TheFunction->getEntryBlock().begin());
+    return TmpB.CreateAlloca(Type::getDoubleTy(*TheContext), 0, VarName);
+}
+
+/**
  * @brief 创建并返回一个ConstantFP.
  * 数值常量由ConstantFP类表示，该类在内部保存APFloat中的数值
  * (APFloat可以保存任意精度的浮点常量
@@ -669,7 +686,8 @@ Value *NumberExprAST::codegen()
 }
 
 /**
- * @brief 检查map中是否有指定的名称(如果没有，则表示引用了一个未知变量)并返回该变量的值
+ * @brief 检查map中是否有指定的名称(如果没有，
+ * 则表示引用了一个未知变量)并返回该变量的值
  *
  * @return Value* 变量的值
  */
@@ -679,7 +697,8 @@ Value *VariableExprAST::codegen()
     Value *V = NamedValues[Name];
     if (!V)
         LogErrorV("Unknown variable name");
-    return V;
+    // 从内存中加载变量值
+    return Builder->CreateLoad(V, Name.c_str());
 }
 
 /**
@@ -689,6 +708,28 @@ Value *VariableExprAST::codegen()
  */
 Value *BinaryExprAST::codegen()
 {
+    // 特殊情况, 不将LHS作为表达式发射
+    // 只允许x=expr, 而不是(x+1)=expr
+    if (Op == '=')
+    {
+        // 要求LHS是一个id
+        VariableExprAST *LHSE = dynamic_cast<VariableExprAST *>(LHS.get());
+        if (!LHSE)
+            return LogErrorV("destination of '=' must be a variable");
+        // 生成右边IR
+        Value *Val = RHS->codegen();
+        if (!Val)
+            return nullptr;
+
+        // 查看变量
+        Value *Variable = NamedValues[LHSE->getName()];
+        if (!Variable)
+            return LogErrorV("Unknown variable name");
+
+        Builder->CreateStore(Val, Variable);
+        return Val;
+    }
+
     Value *L = LHS->codegen();
     Value *R = RHS->codegen();
     if (!L || !R)
@@ -787,7 +828,16 @@ Function *FunctionAST::codegen()
     // 在 NamedValues 中记录函数参数
     NamedValues.clear();
     for (auto &Arg : TheFunction->args())
-        NamedValues[string(Arg.getName())] = &Arg;
+    {
+        // 给当前参数分配alloca
+        AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, Arg.getName());
+
+        // 把初始值存入alloca
+        Builder->CreateStore(&Arg, Alloca);
+
+        // 把变量加入符号表
+        NamedValues[string(Arg.getName())] = Alloca;
+    }
 
     // 生成函数体
     if (Value *RetVal = Body->codegen())
@@ -868,14 +918,21 @@ Value *IfExprAST::codegen()
 
 Value *ForExprAST::codegen()
 {
+
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // 给entry块中的变量创建一个alloca
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
     // 发射start部分的IR(即初始化变量的表达式), 这个范围内没有变量
     Value *StartVal = Start->codegen();
     if (!StartVal)
         return nullptr;
 
+    // 将变量值存储到alloca中
+    Builder->CreateStore(StartVal, Alloca);
+
     // 为循环头的开始设置基本块, 在当前块后插入
-    Function *TheFunction = Builder->GetInsertBlock()->getParent();
-    BasicBlock *PreheaderBB = Builder->GetInsertBlock(); // 循环开始部分
     BasicBlock *LoopBB = BasicBlock::Create(*TheContext, "loop", TheFunction);
 
     // 显式从当前块跳转到LoopBB块
@@ -884,14 +941,10 @@ Value *ForExprAST::codegen()
     // 开始在LoopBB中插入
     Builder->SetInsertPoint(LoopBB);
 
-    // 将循环开始的Start作为phi节点初始值, 现在还不能设置第二个值
-    PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName.c_str());
-    Variable->addIncoming(StartVal, PreheaderBB);
-
     // 在循环中, 变量被定义为PHI节点, 如果隐藏了外部同名变量
     // 出循环后要恢复它的值, 所有现在保存它
-    Value *OldVal = NamedValues[VarName];
-    NamedValues[VarName] = Variable;
+    AllocaInst *OldVal = NamedValues[VarName];
+    NamedValues[VarName] = Alloca;
 
     // 发射循环体IR, 这与任何其他expr一样, 可以更改当前BB
     // 请注意, 我们忽略了主体计算的值, 但不允许出现错误
@@ -912,18 +965,20 @@ Value *ForExprAST::codegen()
         StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
     }
 
-    Value *NextVal = Builder->CreateFAdd(Variable, StepVal, "nextvar");
-
     // 计算end条件
     Value *EndCond = End->codegen();
     if (!EndCond)
         return nullptr;
 
+    // 重新载入变量, 递增, 写回变量. 这里处理了循环体改变变量的情况
+    Value *CurVar = Builder->CreateLoad(Alloca);
+    Value *NextVar = Builder->CreateFAdd(CurVar, StepVal, "nextvar");
+    Builder->CreateStore(NextVar, Alloca);
+
     // 通过比较将不等于0.0的条件转换为布尔值
     EndCond = Builder->CreateFCmpONE(EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
 
     // 创建after loop块并插入
-    BasicBlock *LoopEndBB = Builder->GetInsertBlock();
     BasicBlock *AfterBB = BasicBlock::Create(*TheContext, "afterloop", TheFunction);
 
     // 将条件分支插入LoopEndBB末尾
@@ -931,9 +986,6 @@ Value *ForExprAST::codegen()
 
     // 循环体结束, 以后其它代码都插入到AfterBB
     Builder->SetInsertPoint(AfterBB);
-
-    // 给PHI节点一个新入口
-    Variable->addIncoming(NextVal, LoopEndBB);
 
     // 恢复隐藏的变量
     if (OldVal)
@@ -974,6 +1026,8 @@ static void InitializeModuleAndPassManager()
     // 创建pass管理器
     TheFPM = make_unique<legacy::FunctionPassManager>(TheModule.get());
 
+    // mem2reg pass
+    TheFPM->add(createPromoteMemoryToRegisterPass());
     // 窥孔优化和bit-twiddling optzns
     TheFPM->add(createInstructionCombiningPass());
     // 重新关联表达式
@@ -1129,6 +1183,7 @@ int main()
 
     // Install standard binary operators.
     // 1 is lowest precedence.
+    BinopPrecedence['='] = 2;
     BinopPrecedence['<'] = 10;
     BinopPrecedence['+'] = 20;
     BinopPrecedence['-'] = 20;
