@@ -50,6 +50,7 @@ enum Token
     tok_in = -10,
     tok_binary = -11,
     tok_unary = -12,
+    tok_var = -13,
 };
 
 static string IdentifierStr; // token为tok_identifier时填充
@@ -89,6 +90,8 @@ static int gettok()
             return tok_binary;
         if (IdentifierStr == "unary")
             return tok_unary;
+        if (IdentifierStr == "var")
+            return tok_var;
         return tok_identifier;
     }
     // 识别数字
@@ -262,6 +265,20 @@ public:
     Value *codegen() override;
 };
 
+// VarExprAST - Expression class for var/in
+class VarExprAST : public ExprAST
+{
+    vector<pair<string, unique_ptr<ExprAST>>> VarNames;
+    unique_ptr<ExprAST> Body;
+
+public:
+    VarExprAST(vector<pair<string, unique_ptr<ExprAST>>> VarNames,
+               unique_ptr<ExprAST> Body)
+        : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
+
+    Value *codegen() override;
+};
+
 static int CurTok; //缓冲
 static int getNextToken()
 {
@@ -421,10 +438,65 @@ static unique_ptr<ExprAST> ParseForExpr()
                                    std::move(Body));
 }
 
+// 定义的变量作用域是in后面的expr, 即body, 访问var定义的变量
+// varexpr ::= 'var' identifier ('=' expression)?
+//                    (',' identifier ('=' expression)?)* 'in' expression
+static unique_ptr<ExprAST> ParseVarExpr()
+{
+    getNextToken(); // eat the var
+
+    vector<pair<string, unique_ptr<ExprAST>>> VarNames;
+
+    // 最少定义一个变量名
+    if (CurTok != tok_identifier)
+        return LogError("expected identifier after var");
+
+    // 捕获变量列表
+    while (1)
+    {
+        string Name = IdentifierStr;
+        getNextToken(); // eat identifier
+
+        // 读取可选的初始值
+        unique_ptr<ExprAST> Init;
+        if (CurTok == '=')
+        {
+            getNextToken(); // eat the '='
+
+            Init = ParseExpression();
+            if (!Init)
+                return nullptr;
+        }
+
+        VarNames.push_back(make_pair(Name, std::move(Init)));
+
+        // 定义变量结束, 退出循环
+        if (CurTok != ',')
+            break;
+        getNextToken(); // eat ','
+
+        if (CurTok != tok_identifier)
+            return LogError("expected identifier list after var");
+    }
+
+    // 解析body并创建AST节点, 现在token是in
+    if (CurTok != tok_in)
+        return LogError("expected 'in' keyword after 'var'");
+    getNextToken(); // eat 'in'
+
+    auto Body = ParseExpression();
+    if (!Body)
+        return nullptr;
+    return make_unique<VarExprAST>(std::move(VarNames), std::move(Body));
+}
+
 // primary
 //   ::= identifierexpr
 //   ::= numberexpr
 //   ::= parenexpr
+//   ::= ifexpr
+//   ::= forexpr
+//   ::= varexpr
 static unique_ptr<ExprAST> ParsePrimary()
 {
     switch (CurTok)
@@ -441,6 +513,8 @@ static unique_ptr<ExprAST> ParsePrimary()
         return ParseIfExpr();
     case tok_for:
         return ParseForExpr();
+    case tok_var:
+        return ParseVarExpr();
     }
 }
 
@@ -1010,6 +1084,57 @@ Value *UnaryExprAST::codegen()
     return Builder->CreateCall(F, OperandV, "unop");
 }
 
+Value *VarExprAST::codegen()
+{
+    vector<AllocaInst *> OldBindings;
+
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // 注册所有变量并让其初始化
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+    {
+        const string &VarName = VarNames[i].first;
+        ExprAST *Init = VarNames[i].second.get();
+
+        // 在将变量添加到作用域之前发出初始化程序, 这可以防止初始化程序引用变量本身,
+        // 并允许这样的东西:
+        // var a = 1 in
+        // var a = a in ... # 引用外部 'a'
+        Value *InitVal;
+        if (Init)
+        {
+            InitVal = Init->codegen();
+            if (!InitVal)
+                return nullptr;
+        }
+        else
+        { // 使用默认值
+            InitVal = ConstantFP::get(*TheContext, APFloat(0.0));
+        }
+
+        AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+        Builder->CreateStore(InitVal, Alloca);
+
+        // 记住旧的变量绑定, 这样我们可以在取消递归时恢复绑定
+        OldBindings.push_back(NamedValues[VarName]);
+
+        // 记录当前绑定
+        NamedValues[VarName] = Alloca;
+    }
+
+    // 生成body, 现在所有变量都在作用域内
+    Value *BodyVal = Body->codegen();
+    if (!BodyVal)
+        return nullptr;
+
+    // 把作用域中的变量退栈, 恢复之前的变量绑定
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+        NamedValues[VarNames[i].first] = OldBindings[i];
+
+    // 返回body计算值
+    return BodyVal;
+}
+
 //===----------------------------------------------------------------------===//
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
@@ -1106,7 +1231,6 @@ static void HandleTopLevelExpression()
 
             // 搜索JIT中的__anon_expr符号
             auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
-            fprintf(stderr, "\n");
             double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
             fprintf(stderr, "\nEvaluated to %f\n", FP());
 
